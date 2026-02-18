@@ -161,7 +161,7 @@ func filterPaths(entries []*github.TreeEntry, path string, maxResults int) []str
 	return matchedPaths
 }
 
-// looksLikeSHA returns true if the string appears to be a Git commit SHA.
+// looksLikeSHA returns true if the string appears to be a full Git object SHA.
 // A SHA is a 40-character hexadecimal string.
 func looksLikeSHA(s string) bool {
 	if len(s) != 40 {
@@ -200,7 +200,13 @@ func looksLikeSHA(s string) bool {
 //     ("refs/tags/<ref>").
 //
 //  3. **Final Lookup:** Once a fully-qualified ref is determined, a final API call
-//     is made to fetch that reference's definitive commit SHA.
+//     is made to fetch that reference's object SHA.
+//
+//  4. **Annotated Tag Dereferencing:** If the resolved reference points to a tag
+//     object (as opposed to a commit), the tag is dereferenced via an additional
+//     API call to obtain the underlying commit SHA. This is necessary because
+//     annotated tags reference a tag object, not a commit directly, and the
+//     Contents/Raw APIs require a commit SHA.
 //
 // Any unexpected (non-404) errors during the resolution process are returned
 // immediately. All API errors are logged with rich context to aid diagnostics.
@@ -298,7 +304,24 @@ func resolveGitReference(ctx context.Context, githubClient *github.Client, owner
 		}
 	}
 
+	// 3) Extract the SHA from the resolved reference.
 	sha = reference.GetObject().GetSHA()
+
+	// 4) Annotated tags have object type "tag" and their SHA points to a
+	// tag object, not a commit. The Contents and Raw APIs require a
+	// commit SHA, so we dereference the tag to obtain the underlying commit.
+	if reference.GetObject().GetType() == "tag" {
+		tagObj, resp, tagErr := githubClient.Git.GetTag(ctx, owner, repo, sha)
+		if tagErr != nil {
+			_, _ = ghErrors.NewGitHubAPIErrorToCtx(ctx, "failed to dereference annotated tag", resp, tagErr)
+			return nil, false, fmt.Errorf("failed to dereference annotated tag %q: %w", ref, tagErr)
+		}
+		if resp != nil && resp.Body != nil {
+			defer func() { _ = resp.Body.Close() }()
+		}
+		sha = tagObj.GetObject().GetSHA()
+	}
+
 	return &raw.ContentOpts{Ref: ref, SHA: sha}, fallbackUsed, nil
 }
 
